@@ -2,17 +2,156 @@
 import numpy as np
 import pdb
 
+import torch
 from torchvision.models import resnet18
 import torch.nn.functional as F
 import torch.nn as nn
+from torch.utils.data import TensorDataset
 
-import torch
-import pytorch_lightning as pl
-from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning import callbacks as pl_callbacks
-from pytorch_lightning import seed_everything
+import lpips
 
-from utils import norm, denorm
+
+##############################
+#        Bicycle GAN 
+##############################
+class BicycleGAN(nn.Module):
+    def __init__(self, args, val_loader):
+        super().__init__()
+        
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.args = args
+        
+        self.mae_loss = nn.L1Loss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.loss_fn_alex = lpips.LPIPS(net='alex').to(device)
+
+        self.generator = Generator(args).to(device)
+        self.encoder = Encoder(args).to(device)
+        self.D_VAE = Discriminator(args).to(device)
+        self.D_LR = Discriminator(args).to(device)
+
+
+        self.optimizer_E = torch.optim.Adam(self.encoder.parameters(), lr=args.lr)
+        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=args.lr)
+        self.optimizer_D_VAE = torch.optim.Adam(self.D_VAE.parameters(), lr=args.lr)
+        self.optimizer_D_LR = torch.optim.Adam(self.D_LR.parameters(), lr=args.lr)
+
+        self.valid = torch.ones(1)
+        self.fake = torch.zeros(1)
+        self.valid_target, fake_target = None, None
+
+        # FID real_set
+        real_set = []
+        for idx, data in enumerate(val_loader, 0):
+            edge_tensor, rgb_tensor = data
+            real_B = rgb_tensor = rgb_tensor.to(device)
+            
+            real_set.append(real_B)
+        self.real_dataset = TensorDataset(torch.cat(real_set))
+    
+    def forward_EG(self):
+        _ = self.D_VAE.requires_grad_(False)
+        _ = self.D_LR.requires_grad_(False)
+        _ = self.generator.requires_grad_(True)
+        _ = self.encoder.requires_grad_(True)
+        
+        device = self.device
+        bz = len(self.real_A)
+        nz = self.args.nz
+        
+        # cVAE-GAN EG
+        self.mu_B, self.logvar_B = self.encoder(self.real_B)
+        self.z_encoded = torch.randn(bz, nz, device=device) * torch.exp(self.logvar_B) + self.mu_B
+
+        self.fakeB_encoded = self.generator(self.real_A, self.z_encoded)
+        self.pred_fakeB_encoded = self.D_VAE([self.real_A, self.fakeB_encoded])
+        
+        # cLR-GAN G
+        self.z_random = torch.randn(bz, nz, device=device)
+        self.fake_B_random = self.generator(self.real_A, self.z_random)
+        self.pred_fakeB_random = self.D_LR([self.real_A, self.fake_B_random])
+        
+        self.mu_z_recons, self.logvar_z_recons = self.encoder(self.fake_B_random)
+
+    def backward_EG(self):
+        self.opt_set_zero_grad([self.optimizer_E, self.optimizer_G])
+        device = self.device
+        
+        if self.valid_target is None:
+            self.valid_target = self.valid.expand_as(self.pred_fakeB_encoded).to(device)
+            self.fake_target = self.fake.expand_as(self.pred_fakeB_encoded).to(device)
+        
+        self.loss_G_GAN_encoded = self.bce_loss(self.pred_fakeB_encoded, self.fake_target)
+        self.loss_image_l1 = self.mae_loss(self.fakeB_encoded, self.real_B) * self.args.l_pixel
+        self.loss_KL = (0.5 * (torch.exp(self.logvar_B) + self.mu_B**2 - 1 - self.logvar_B).sum()) * self.args.l_kl
+
+        self.loss_G_GAN_random = self.bce_loss(self.pred_fakeB_random, self.fake_target)
+        
+        _ = self.encoder.requires_grad_(False)
+        self.loss_latent_l1 = self.mae_loss(self.z_random, self.mu_z_recons) * self.args.l_latent
+        _ = self.encoder.requires_grad_(True)
+
+        loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random + self.loss_latent_l1
+
+        loss.backward()
+    
+    def forward_D(self):
+        _ = self.D_VAE.requires_grad_(True)
+        _ = self.D_LR.requires_grad_(True)
+        _ = self.generator.requires_grad_(False)
+        _ = self.encoder.requires_grad_(False)
+        
+        self.pred_realB_encoded = self.D_VAE([self.real_A, self.real_B])
+        self.pred_fakeB_encoded = self.D_VAE([self.real_A, self.fakeB_encoded.detach()])
+        self.pred_realB_random = self.D_LR([self.real_A, self.real_B])
+        self.pred_fakeB_random = self.D_LR([self.real_A, self.fake_B_random.detach()])
+    
+    def backward_D(self):
+        self.opt_set_zero_grad([self.optimizer_D_VAE, self.optimizer_D_LR])
+        
+        #-------------------------------
+        # Train Discriminator (cVAE-GAN)
+        #-------------------------------
+        loss_D_GAN_encoded_real = self.bce_loss(self.pred_realB_encoded, self.valid_target)
+        loss_D_GAN_encoded_fake = self.bce_loss(self.pred_fakeB_encoded, self.fake_target)
+        self.loss_D_GAN_encoded = loss_D_GAN_encoded_real + loss_D_GAN_encoded_fake
+        self.loss_D_GAN_encoded.backward()
+
+        #-------------------------------
+        # Train Discriminator (cLR-GAN)
+        #-------------------------------
+        loss_D_GAN_random_real = self.bce_loss(self.pred_realB_random, self.valid_target)
+        loss_D_GAN_random_fake = self.bce_loss(self.pred_fakeB_random, self.fake_target)
+        self.loss_D_GAN_random = loss_D_GAN_random_real + loss_D_GAN_random_fake
+        self.loss_D_GAN_random.backward()
+    
+    def opt_set_zero_grad(self, optimizers):
+        for opt in optimizers:
+            opt.zero_grad()
+    
+    def opt_take_step(self, optimizers):
+        for opt in optimizers:
+            opt.step()
+    
+    def update_EG(self):
+        self.forward_EG()
+        self.backward_EG()
+        self.opt_take_step([self.optimizer_E, self.optimizer_G])
+
+    def update_D(self):
+        self.forward_D()
+        self.backward_D()
+        self.opt_take_step([self.optimizer_D_VAE, self.optimizer_D_LR])
+    
+    def optimize(self, real_A, real_B):
+        self.real_A = real_A
+        self.real_B = real_B
+        
+        self.update_EG()
+        self.update_D()
+
+
 
 ##############################
 #        Encoder 
@@ -114,13 +253,9 @@ class Unet_z(nn.Module):
         if self.submodule:
             out = self.submodule(out, z)
 
-        # print("out before up size {}".format(out.size()))
-        
         out = self.up(out)
         if not self.outermost:
             out = torch.cat([out, x], dim=1)
-
-        # print("out after up size {}".format(out.size()))
         return out
         
 class Generator(nn.Module):

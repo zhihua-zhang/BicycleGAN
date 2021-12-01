@@ -1,9 +1,3 @@
-import os
-try:
-    os.chdir(os.getcwd() + "/workspace/cis680/final/repo")
-except:
-    pass
-
 from torch.utils import data
 from PIL import Image
 import numpy as np
