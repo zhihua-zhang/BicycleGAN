@@ -3,12 +3,14 @@ import json
 import numpy as np
 import tqdm
 from scipy import linalg
+from matplotlib import pyplot as plt
 
 import torch
 from torch.utils.data import TensorDataset
-import lpips
 from pytorch_fid.inception import InceptionV3
+import torchvision.utils as vutils
 
+import lpips
 
 # Normalize image tensor
 def norm(image):
@@ -18,41 +20,6 @@ def norm(image):
 def denorm(tensor):
     return (tensor+1.0)/2.0
 	# return ((tensor+1.0)/2.0)*255.0
-
-def log_and_report(model, losses, step, report_feq, epoch, total_steps):
-    loss_GAN_encode = model.loss_G_GAN_encoded.item() + model.loss_D_GAN_encoded.item()
-    loss_GAN_random = model.loss_G_GAN_random.item() + model.loss_D_GAN_random.item()
-    loss_image_l1 = model.loss_image_l1.item()
-    loss_latent_l1 = model.loss_latent_l1.item()
-    loss_KL = model.loss_KL.item()
-    total_loss = loss_GAN_encode + loss_GAN_random + loss_image_l1 + loss_latent_l1 + loss_KL
-
-    losses["loss_GAN_encode"].append(loss_GAN_encode)
-    losses["loss_GAN_random"].append(loss_GAN_random)
-    losses["loss_image_l1"].append(loss_image_l1)
-    losses["loss_latent_l1"].append(loss_latent_l1)
-    losses["loss_KL"].append(loss_KL)
-    losses["total_loss"].append(total_loss)
-
-    if step % report_feq == report_feq-1:
-        print('Epoch {}, Step {}/{}: Total Loss: {:.3f} loss_GAN_encode: {:.3f} loss_GAN_random: {:.3f} loss_image_l1: {:.3f} loss_latent_l1: {:.3f} loss_KL: {:.3f}'.format
-                    (epoch+1, step+1, total_steps, total_loss, loss_GAN_encode, loss_GAN_random, loss_image_l1, loss_latent_l1, loss_KL))
-
-def save_results(model, losses, epoch):
-    if os.path.exists("./checkpoints"):
-        os.system("rm -rf ./checkpoints")
-    os.makedirs("./checkpoints", exist_ok=True)
-    torch.save(model.generator, "./checkpoints/generator-epoch={}.pth".format(epoch+1))
-    torch.save(model.encoder, "./checkpoints/encoder-epoch={}.pth".format(epoch+1))
-    torch.save(model.D_VAE, "./checkpoints/D_VAE-epoch={}.pth".format(epoch+1))
-    torch.save(model.D_LR, "./checkpoints/D_LR-epoch={}.pth".format(epoch+1))
-
-    if os.path.exists("./logs"):
-        os.system("rm -rf ./checkpoints")
-    os.makedirs("./logs", exist_ok=True)
-    with open("./logs/losses-epoch={}".format(epoch+1), "w") as f:
-        json.dump(losses, f)
-
 
 def build_feature_table(dataset, model, batch_size, dim, device):
     '''
@@ -205,3 +172,74 @@ def eval_LPIPS_score(model, gen_dataset):
             lpips_score.append(d)
     lpips_score = torch.mean(torch.cat(lpips_score)).item()
     return lpips_score
+
+
+
+def log_and_report(model, losses, step, report_feq, epoch, total_steps):
+    loss_GAN_encode = model.loss_G_GAN_encoded.item() + model.loss_D_GAN_encoded.item()
+    loss_GAN_random = model.loss_G_GAN_random.item() + model.loss_D_GAN_random.item()
+    loss_image_l1 = model.loss_image_l1.item()
+    loss_latent_l1 = model.loss_latent_l1.item()
+    loss_KL = model.loss_KL.item()
+    total_loss = loss_GAN_encode + loss_GAN_random + loss_image_l1 + loss_latent_l1 + loss_KL
+
+    losses["loss_GAN_encode"].append(loss_GAN_encode)
+    losses["loss_GAN_random"].append(loss_GAN_random)
+    losses["loss_image_l1"].append(loss_image_l1)
+    losses["loss_latent_l1"].append(loss_latent_l1)
+    losses["loss_KL"].append(loss_KL)
+    losses["total_loss"].append(total_loss)
+
+    if step % report_feq == report_feq-1:
+        print('Epoch {}, Step {}/{}: Total Loss: {:.3f} loss_GAN_encode: {:.3f} loss_GAN_random: {:.3f} loss_image_l1: {:.3f} loss_latent_l1: {:.3f} loss_KL: {:.3f}'.format
+                    (epoch+1, step+1, total_steps, total_loss, loss_GAN_encode, loss_GAN_random, loss_image_l1, loss_latent_l1, loss_KL))
+
+def save_results(model, losses, epoch):
+    if os.path.exists("./checkpoints"):
+        os.system("rm -rf ./checkpoints")
+    os.makedirs("./checkpoints", exist_ok=True)
+    torch.save(model.generator.state_dict(), "./checkpoints/generator-epoch={}.pth".format(epoch+1))
+    torch.save(model.encoder.state_dict(), "./checkpoints/encoder-epoch={}.pth".format(epoch+1))
+    torch.save(model.D_VAE.state_dict(), "./checkpoints/D_VAE-epoch={}.pth".format(epoch+1))
+    torch.save(model.D_LR.state_dict(), "./checkpoints/D_LR-epoch={}.pth".format(epoch+1))
+
+    if os.path.exists("./logs"):
+        os.system("rm -rf ./logs")
+    os.makedirs("./logs", exist_ok=True)
+    with open("./logs/losses-epoch={}".format(epoch+1), "w") as f:
+        json.dump(losses, f)
+
+def infer_viz(model, val_loader, epoch, n_plot):
+    device = model.device
+    imgs = []
+    fig, ax = plt.subplots(1, 1, figsize=(16, 3*n_plot))
+
+    with torch.no_grad():
+        for idx, data in enumerate(val_loader, 0):
+            if idx == n_plot:
+                break
+            
+            edge_tensor, rgb_tensor = data
+            edge_tensor, rgb_tensor = norm(edge_tensor).to(device), norm(rgb_tensor).to(device)
+            real_A = edge_tensor
+            real_B = rgb_tensor
+            bz = real_A.size(0)
+        
+            img = [real_A.cpu()]
+            for _ in range(3):
+                z_random = torch.randn(bz, model.args.nz, device=device)
+                gen_B_random = model.generator(real_A, z_random).detach().cpu()
+                img.append(gen_B_random)
+            img += [real_B.cpu()]
+            img = torch.cat(img)
+            imgs.append(img)
+
+    imgs = torch.cat(imgs)
+    viz = vutils.make_grid(imgs, nrow=5, padding=2, normalize=True).permute(1,2,0)
+
+    ax.imshow(viz)
+
+    fig.suptitle(f"Images generated by bicycleGAN, epoch={epoch+1}", fontsize=18)
+    ax.set_title("left: real_edge, middle: fake_shoe, right: real_shoe")
+    os.makedirs("./results", exist_ok=True)
+    fig.savefig(f"./results/biGAN_viz_epoch={epoch+1}.png")

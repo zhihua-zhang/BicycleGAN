@@ -39,7 +39,7 @@ class BicycleGAN(nn.Module):
 
         self.valid = torch.ones(1)
         self.fake = torch.zeros(1)
-        self.valid_target, fake_target = None, None
+        self.valid_target_encoded = None
 
         # FID real_set
         real_set = []
@@ -57,20 +57,19 @@ class BicycleGAN(nn.Module):
         _ = self.encoder.requires_grad_(True)
         
         device = self.device
-        bz = len(self.real_A)
         nz = self.args.nz
         
         # cVAE-GAN EG
-        self.mu_B, self.logvar_B = self.encoder(self.real_B)
-        self.z_encoded = torch.randn(bz, nz, device=device) * torch.exp(self.logvar_B) + self.mu_B
+        self.mu_B, self.logvar_B = self.encoder(self.real_B_encoded)
+        self.z_encoded = torch.randn(self.bz1, nz, device=device) * torch.exp(0.5 * self.logvar_B) + self.mu_B
 
-        self.fakeB_encoded = self.generator(self.real_A, self.z_encoded)
-        self.pred_fakeB_encoded = self.D_VAE([self.real_A, self.fakeB_encoded])
+        self.fakeB_encoded = self.generator(self.real_A_encoded, self.z_encoded)
+        self.pred_fakeB_encoded = self.D_VAE([self.real_A_encoded, self.fakeB_encoded])
         
         # cLR-GAN G
-        self.z_random = torch.randn(bz, nz, device=device)
-        self.fake_B_random = self.generator(self.real_A, self.z_random)
-        self.pred_fakeB_random = self.D_LR([self.real_A, self.fake_B_random])
+        self.z_random = torch.randn(self.bz2, nz, device=device)
+        self.fake_B_random = self.generator(self.real_A_random, self.z_random)
+        self.pred_fakeB_random = self.D_LR([self.real_A_random, self.fake_B_random])
         
         self.mu_z_recons, self.logvar_z_recons = self.encoder(self.fake_B_random)
 
@@ -78,34 +77,36 @@ class BicycleGAN(nn.Module):
         self.opt_set_zero_grad([self.optimizer_E, self.optimizer_G])
         device = self.device
         
-        if self.valid_target is None:
-            self.valid_target = self.valid.expand_as(self.pred_fakeB_encoded).to(device)
-            self.fake_target = self.fake.expand_as(self.pred_fakeB_encoded).to(device)
+        if self.valid_target_encoded is None:
+            self.valid_target_encoded = self.valid.expand_as(self.pred_fakeB_encoded).to(device)
+            self.fake_target_encoded = self.fake.expand_as(self.pred_fakeB_encoded).to(device)
+            self.valid_target_random = self.valid.expand_as(self.pred_fakeB_random).to(device)
+            self.fake_target_random = self.fake.expand_as(self.pred_fakeB_random).to(device)
         
-        self.loss_G_GAN_encoded = self.bce_loss(self.pred_fakeB_encoded, self.fake_target)
-        self.loss_image_l1 = self.mae_loss(self.fakeB_encoded, self.real_B) * self.args.l_pixel
-        self.loss_KL = (0.5 * (torch.exp(self.logvar_B) + self.mu_B**2 - 1 - self.logvar_B).sum()) * self.args.l_kl
+        self.loss_G_GAN_encoded = self.bce_loss(self.pred_fakeB_encoded, self.fake_target_encoded)
+        self.loss_image_l1 = self.mae_loss(self.fakeB_encoded, self.real_B_encoded) * self.args.l_pixel
+        self.loss_KL = 0.5 * torch.sum(torch.exp(self.logvar_B) + self.mu_B**2 - 1 - self.logvar_B, dim=1).mean() * self.args.l_kl
 
-        self.loss_G_GAN_random = self.bce_loss(self.pred_fakeB_random, self.fake_target)
+        self.loss_G_GAN_random = self.bce_loss(self.pred_fakeB_random, self.fake_target_random)
+        loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random
+        loss.backward(retain_graph=True)
+        
         
         _ = self.encoder.requires_grad_(False)
         self.loss_latent_l1 = self.mae_loss(self.z_random, self.mu_z_recons) * self.args.l_latent
+        loss = self.loss_latent_l1
+        loss.backward()
         _ = self.encoder.requires_grad_(True)
 
-        loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random + self.loss_latent_l1
-
-        loss.backward()
     
     def forward_D(self):
         _ = self.D_VAE.requires_grad_(True)
         _ = self.D_LR.requires_grad_(True)
-        _ = self.generator.requires_grad_(False)
-        _ = self.encoder.requires_grad_(False)
         
-        self.pred_realB_encoded = self.D_VAE([self.real_A, self.real_B])
-        self.pred_fakeB_encoded = self.D_VAE([self.real_A, self.fakeB_encoded.detach()])
-        self.pred_realB_random = self.D_LR([self.real_A, self.real_B])
-        self.pred_fakeB_random = self.D_LR([self.real_A, self.fake_B_random.detach()])
+        self.pred_realB_encoded = self.D_VAE([self.real_A_encoded, self.real_B_encoded])
+        self.pred_fakeB_encoded = self.D_VAE([self.real_A_encoded, self.fakeB_encoded.detach()])
+        self.pred_realB_random = self.D_LR([self.real_A_random, self.real_B_random])
+        self.pred_fakeB_random = self.D_LR([self.real_A_random, self.fake_B_random.detach()])
     
     def backward_D(self):
         self.opt_set_zero_grad([self.optimizer_D_VAE, self.optimizer_D_LR])
@@ -113,16 +114,16 @@ class BicycleGAN(nn.Module):
         #-------------------------------
         # Train Discriminator (cVAE-GAN)
         #-------------------------------
-        loss_D_GAN_encoded_real = self.bce_loss(self.pred_realB_encoded, self.valid_target)
-        loss_D_GAN_encoded_fake = self.bce_loss(self.pred_fakeB_encoded, self.fake_target)
+        loss_D_GAN_encoded_real = self.bce_loss(self.pred_realB_encoded, self.valid_target_encoded)
+        loss_D_GAN_encoded_fake = self.bce_loss(self.pred_fakeB_encoded, self.fake_target_encoded)
         self.loss_D_GAN_encoded = loss_D_GAN_encoded_real + loss_D_GAN_encoded_fake
         self.loss_D_GAN_encoded.backward()
 
         #-------------------------------
         # Train Discriminator (cLR-GAN)
         #-------------------------------
-        loss_D_GAN_random_real = self.bce_loss(self.pred_realB_random, self.valid_target)
-        loss_D_GAN_random_fake = self.bce_loss(self.pred_fakeB_random, self.fake_target)
+        loss_D_GAN_random_real = self.bce_loss(self.pred_realB_random, self.valid_target_random)
+        loss_D_GAN_random_fake = self.bce_loss(self.pred_fakeB_random, self.fake_target_random)
         self.loss_D_GAN_random = loss_D_GAN_random_real + loss_D_GAN_random_fake
         self.loss_D_GAN_random.backward()
     
@@ -144,9 +145,14 @@ class BicycleGAN(nn.Module):
         self.backward_D()
         self.opt_take_step([self.optimizer_D_VAE, self.optimizer_D_LR])
     
-    def optimize(self, real_A, real_B):
-        self.real_A = real_A
-        self.real_B = real_B
+    def optimize(self, real_A_encoded, real_B_encoded, real_A_random, real_B_random):
+        self.real_A_encoded = real_A_encoded
+        self.real_B_encoded = real_B_encoded
+        self.real_A_random = real_A_random
+        self.real_B_random = real_B_random
+
+        self.bz1 = len(real_A_encoded)
+        self.bz2 = len(real_A_random)
         
         self.update_EG()
         self.update_D()
@@ -218,18 +224,21 @@ class Unet_z(nn.Module):
             # (w,h)==(1,1), unable to ins norm
             down += [nn.InstanceNorm2d(inner_nc)]
         if not outermost:
-            down = [nn.ReLU(inplace=True)] + down
             # option 1: use Leaky ReLU
-            # down = [nn.LeakyReLU(0.2, inplace=True)] + down
+            down = [nn.LeakyReLU(0.2, inplace=True)] + down
+            # down = [nn.ReLU(inplace=True)] + down
         
         # upsample
         up = []
         up += [nn.ReLU()]
+        if not innermost:
+            inner_nc *= 2
         # option 3: how to upsample
-        if innermost:
-            up += [nn.ConvTranspose2d(inner_nc, outer_nc, kernel_size=4, stride=2, padding=1)]
-        else:
-            up += [nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1)]
+        up += [
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(inner_nc, outer_nc, kernel_size=3, stride=1, padding=1),
+        ]
+        # up += [nn.ConvTranspose2d(inner_nc, outer_nc, kernel_size=4, stride=2, padding=1)]
         if not outermost:
             up += [nn.InstanceNorm2d(outer_nc)]
         else:
@@ -278,15 +287,15 @@ class Generator(nn.Module):
         image_nc, self.h, self.w = args.image_shape
         nz = args.nz
         
-        # option 2: pass z to submodule
-        unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, 0, submodule=None, innermost=True)
+        # option 2: pass z to submodule, i.e., nz!=0
+        unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz, submodule=None, innermost=True)
         
         for _ in range(n_unet - 5):
-            unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, 0, submodule=unet_block)
+            unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz, submodule=unet_block)
 
-        unet_block = Unet_z(base_nc*4, base_nc*4, base_nc*8, 0, submodule=unet_block)
-        unet_block = Unet_z(base_nc*2, base_nc*2, base_nc*4, 0, submodule=unet_block)
-        unet_block = Unet_z(base_nc, base_nc, base_nc*2, 0, submodule=unet_block)
+        unet_block = Unet_z(base_nc*4, base_nc*4, base_nc*8, nz, submodule=unet_block)
+        unet_block = Unet_z(base_nc*2, base_nc*2, base_nc*4, nz, submodule=unet_block)
+        unet_block = Unet_z(base_nc, base_nc, base_nc*2, nz, submodule=unet_block)
         
         unet_block = Unet_z(image_nc, image_nc, base_nc, nz, submodule=unet_block, outermost=True)
         self.model = unet_block

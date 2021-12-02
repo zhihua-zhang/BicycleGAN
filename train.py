@@ -10,11 +10,7 @@ from torch.utils.data import DataLoader
 
 from datasets import Edge2Shoe
 from models import BicycleGAN
-from utils import norm, log_and_report, save_results, eval_FID_score, eval_LPIPS_score
-from vis_tools import infer_viz
-# import vis_tools
-# import importlib
-# importlib.reload(vis_tools)
+from utils import *
 
 import argparse
 def get_args(args=None):
@@ -28,7 +24,7 @@ def get_args(args=None):
                                     model_train:4,\
                                     top_proposal_viz:5,\
                                     nms_infer_viz:6")
-    model_group.add_argument("--bz", type=int, default=4,
+    model_group.add_argument("--bz", type=int, default=128,
                              help="mini-batch size")
     model_group.add_argument("--max_epochs", type=int, default=25,
                              help="number of epochs")
@@ -40,7 +36,7 @@ def get_args(args=None):
                              help="lambda_kl")
     model_group.add_argument("--nz", type=int, default=8,
                              help="latent code dim")
-    model_group.add_argument("--lr", type=float, default=0.0002,
+    model_group.add_argument("--base_lr", type=float, default=0.0002,
                              help="initial lr")
     model_group.add_argument("--weight_decay", type=float, default=0.,
                              help="l2 weight decay")
@@ -67,13 +63,18 @@ if __name__ == "__main__":
     args = get_args()
     args.device = device
     args.image_shape = image_shape
+    args.lr = args.base_lr * args.bz / 128
 
     img_dir_tr = './data/edges2shoes/train/'
     train_ds = Edge2Shoe(img_dir_tr)
-    train_loader = DataLoader(train_ds, batch_size=args.bz, drop_last=True)
+    train_loader = DataLoader(train_ds,
+                              batch_size=args.bz,
+                              drop_last=True,
+                              shuffle=True,
+                              num_workers=4)
     img_dir_val = './data/edges2shoes/val/'
     val_ds = Edge2Shoe(img_dir_val)
-    val_loader = DataLoader(val_ds, batch_size=1, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=1, drop_last=True, num_workers=4)
     
     model = BicycleGAN(args, val_loader).to(device)
 
@@ -91,8 +92,9 @@ if __name__ == "__main__":
 
     step = 0
     report_feq = 1000
-    save_freq = 1
+    save_freq = 3
 
+    print("training starts ...")
     for e in range(args.max_epochs):
         start = time.time()
         
@@ -103,19 +105,19 @@ if __name__ == "__main__":
             edge_tensor, rgb_tensor = norm(edge_tensor).to(device), norm(rgb_tensor).to(device)
             real_A = edge_tensor; real_B = rgb_tensor;
 
-            # # option 4: divide mini-batch images
-            # half_size = bz // 2
-            # # A1, B1 for encoded; A2, B2 for random
-            # real_A_encoded = real_A[0:half_size]
-            # real_B_encoded = real_B[0:half_size]
-            # real_A_random = real_A[half_size:]
-            # real_B_random = real_B[half_size:]
+            # option 4: divide mini-batch images
+            bz1 = len(real_A) // 2
+            bz2 = len(real_A) - bz1
+            # A1, B1 for encoded; A2, B2 for random
+            real_A_encoded = real_A[0:bz1]
+            real_B_encoded = real_B[0:bz1]
+            real_A_random = real_A[bz1:]
+            real_B_random = real_B[bz1:]
 
             #-------------------------------
             # Optimize EG and D
             #-------------------------------
-            
-            model.optimize(real_A, real_B)
+            model.optimize(real_A_encoded, real_B_encoded, real_A_random, real_B_random)
 
             #-------------------------------
             #             Logging
@@ -127,7 +129,7 @@ if __name__ == "__main__":
         end = time.time()
         print("Train Epoch: {}, Time: {:.3f}s".format(e+1, end-start))
 
-        if e+1 == save_freq:
+        if (e+1) % save_freq == 0:
             # visualize
             n_plot = 10
             infer_viz(model, val_loader, epoch=e, n_plot=n_plot)
