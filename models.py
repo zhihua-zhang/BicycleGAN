@@ -23,7 +23,8 @@ class BicycleGAN(nn.Module):
         self.args = args
         
         self.mae_loss = nn.L1Loss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        # self.gan_loss = nn.BCEWithLogitsLoss()
+        self.gan_loss = nn.MSELoss()
         self.loss_fn_alex = lpips.LPIPS(net='alex').to(device)
 
         self.generator = Generator(args).to(device)
@@ -39,7 +40,6 @@ class BicycleGAN(nn.Module):
 
         self.valid = torch.ones(1)
         self.fake = torch.zeros(1)
-        self.valid_target_encoded = None
 
         # FID real_set
         real_set = []
@@ -77,17 +77,16 @@ class BicycleGAN(nn.Module):
         self.opt_set_zero_grad([self.optimizer_E, self.optimizer_G])
         device = self.device
         
-        if self.valid_target_encoded is None:
-            self.valid_target_encoded = self.valid.expand_as(self.pred_fakeB_encoded).to(device)
-            self.fake_target_encoded = self.fake.expand_as(self.pred_fakeB_encoded).to(device)
-            self.valid_target_random = self.valid.expand_as(self.pred_fakeB_random).to(device)
-            self.fake_target_random = self.fake.expand_as(self.pred_fakeB_random).to(device)
+        self.valid_target_encoded = self.valid.expand_as(self.pred_fakeB_encoded).to(device)
+        self.fake_target_encoded = self.fake.expand_as(self.pred_fakeB_encoded).to(device)
+        self.valid_target_random = self.valid.expand_as(self.pred_fakeB_random).to(device)
+        self.fake_target_random = self.fake.expand_as(self.pred_fakeB_random).to(device)
         
-        self.loss_G_GAN_encoded = self.bce_loss(self.pred_fakeB_encoded, self.fake_target_encoded)
+        self.loss_G_GAN_encoded = self.gan_loss(self.pred_fakeB_encoded, self.valid_target_encoded)
         self.loss_image_l1 = self.mae_loss(self.fakeB_encoded, self.real_B_encoded) * self.args.l_pixel
         self.loss_KL = 0.5 * torch.sum(torch.exp(self.logvar_B) + self.mu_B**2 - 1 - self.logvar_B, dim=1).mean() * self.args.l_kl
 
-        self.loss_G_GAN_random = self.bce_loss(self.pred_fakeB_random, self.fake_target_random)
+        self.loss_G_GAN_random = self.gan_loss(self.pred_fakeB_random, self.valid_target_random)
         loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random
         loss.backward(retain_graph=True)
         
@@ -114,16 +113,16 @@ class BicycleGAN(nn.Module):
         #-------------------------------
         # Train Discriminator (cVAE-GAN)
         #-------------------------------
-        loss_D_GAN_encoded_real = self.bce_loss(self.pred_realB_encoded, self.valid_target_encoded)
-        loss_D_GAN_encoded_fake = self.bce_loss(self.pred_fakeB_encoded, self.fake_target_encoded)
+        loss_D_GAN_encoded_real = self.gan_loss(self.pred_realB_encoded, self.valid_target_encoded)
+        loss_D_GAN_encoded_fake = self.gan_loss(self.pred_fakeB_encoded, self.fake_target_encoded)
         self.loss_D_GAN_encoded = loss_D_GAN_encoded_real + loss_D_GAN_encoded_fake
         self.loss_D_GAN_encoded.backward()
 
         #-------------------------------
         # Train Discriminator (cLR-GAN)
         #-------------------------------
-        loss_D_GAN_random_real = self.bce_loss(self.pred_realB_random, self.valid_target_random)
-        loss_D_GAN_random_fake = self.bce_loss(self.pred_fakeB_random, self.fake_target_random)
+        loss_D_GAN_random_real = self.gan_loss(self.pred_realB_random, self.valid_target_random)
+        loss_D_GAN_random_fake = self.gan_loss(self.pred_fakeB_random, self.fake_target_random)
         self.loss_D_GAN_random = loss_D_GAN_random_real + loss_D_GAN_random_fake
         self.loss_D_GAN_random.backward()
     
@@ -342,7 +341,8 @@ class Discriminator(nn.Module):
             *discriminator_block(128, 256),
             *discriminator_block(256, 512),
             nn.ZeroPad2d((1, 0, 1, 0)),
-            nn.Conv2d(512, 1, 4, padding=1)
+            nn.Conv2d(512, 1, 4, padding=1),
+            nn.Sigmoid()
         )
 
     def forward(self, x):

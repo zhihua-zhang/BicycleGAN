@@ -107,7 +107,7 @@ def compute_FID(mu_1, sigma_1, mu_2, sigma_2, eps=1e-6):
     #################################################################
 
     # compute FID score, based on eqution.(10) in pdf FID part.
-    FID_score = np.linalg.norm(mu_diff) + np.diag(sigma_1 + sigma_2 - 2*covmean).sum()
+    FID_score = np.linalg.norm(mu_diff)**2 + np.diag(sigma_1 + sigma_2 - 2*covmean).sum()
     return FID_score
 
 
@@ -161,21 +161,40 @@ def eval_FID_score(model, val_loader, evaluate_num = 200):
             
     gen_dataset = TensorDataset(torch.cat(gen_set))
     FID_score = FID(model.real_dataset, gen_dataset, device)
-    return gen_dataset, FID_score
+    return FID_score
 
-def eval_LPIPS_score(model, gen_dataset):
+def eval_LPIPS_score(model, val_loader):
+    device = model.device
     lpips_score = []
+
     with torch.no_grad():
-        for (real_img, ), (fake_img, ) in zip(model.real_dataset, gen_dataset):
-            real_img, fake_img = map(norm, [real_img, fake_img])
-            d = model.loss_fn_alex(real_img, fake_img)
-            lpips_score.append(d)
+        for idx, data in enumerate(val_loader, 0):
+            edge_tensor, rgb_tensor = data
+            edge_tensor = norm(edge_tensor).to(device)
+            real_A = edge_tensor
+            bz = real_A.size(0)
+            
+            gen_set = []
+            for _ in range(10):
+                z_random = torch.randn(bz, model.args.nz, device=device)
+                gen_B_random = model.generator(real_A, z_random)
+                fake_denorm = denorm(gen_B_random)
+                gen_set.append(fake_denorm)
+            
+            d_all = []
+            for i1 in range(10):
+                for i2 in range(i1+1, 10):
+                    d = model.loss_fn_alex(gen_set[i1], gen_set[i2])
+                    d_all.append(d)
+            
+            lpips_score.append(sum(d_all) / len(d_all))
+            
     lpips_score = torch.mean(torch.cat(lpips_score)).item()
     return lpips_score
 
 
 
-def log_and_report(model, losses, step, report_feq, epoch, total_steps):
+def log_and_report(model, metrics, step, report_feq, epoch, total_steps):
     loss_GAN_encode = model.loss_G_GAN_encoded.item() + model.loss_D_GAN_encoded.item()
     loss_GAN_random = model.loss_G_GAN_random.item() + model.loss_D_GAN_random.item()
     loss_image_l1 = model.loss_image_l1.item()
@@ -183,18 +202,18 @@ def log_and_report(model, losses, step, report_feq, epoch, total_steps):
     loss_KL = model.loss_KL.item()
     total_loss = loss_GAN_encode + loss_GAN_random + loss_image_l1 + loss_latent_l1 + loss_KL
 
-    losses["loss_GAN_encode"].append(loss_GAN_encode)
-    losses["loss_GAN_random"].append(loss_GAN_random)
-    losses["loss_image_l1"].append(loss_image_l1)
-    losses["loss_latent_l1"].append(loss_latent_l1)
-    losses["loss_KL"].append(loss_KL)
-    losses["total_loss"].append(total_loss)
+    metrics["loss_GAN_encode"].append(loss_GAN_encode)
+    metrics["loss_GAN_random"].append(loss_GAN_random)
+    metrics["loss_image_l1"].append(loss_image_l1)
+    metrics["loss_latent_l1"].append(loss_latent_l1)
+    metrics["loss_KL"].append(loss_KL)
+    metrics["total_loss"].append(total_loss)
 
     if step % report_feq == report_feq-1:
         print('Epoch {}, Step {}/{}: Total Loss: {:.3f} loss_GAN_encode: {:.3f} loss_GAN_random: {:.3f} loss_image_l1: {:.3f} loss_latent_l1: {:.3f} loss_KL: {:.3f}'.format
                     (epoch+1, step+1, total_steps, total_loss, loss_GAN_encode, loss_GAN_random, loss_image_l1, loss_latent_l1, loss_KL))
 
-def save_results(model, losses, epoch):
+def save_results(model, metrics, epoch):
     if os.path.exists("./checkpoints"):
         os.system("rm -rf ./checkpoints")
     os.makedirs("./checkpoints", exist_ok=True)
@@ -206,8 +225,8 @@ def save_results(model, losses, epoch):
     if os.path.exists("./logs"):
         os.system("rm -rf ./logs")
     os.makedirs("./logs", exist_ok=True)
-    with open("./logs/losses-epoch={}".format(epoch+1), "w") as f:
-        json.dump(losses, f)
+    with open("./logs/metrics-epoch={}".format(epoch+1), "w") as f:
+        json.dump(metrics, f)
 
 def infer_viz(model, val_loader, epoch, n_plot):
     device = model.device

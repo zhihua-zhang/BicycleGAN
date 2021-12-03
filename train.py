@@ -63,41 +63,42 @@ if __name__ == "__main__":
     args = get_args()
     args.device = device
     args.image_shape = image_shape
-    args.lr = args.base_lr * args.bz / 128
+    args.lr = args.base_lr * args.bz / 32
 
     img_dir_tr = './data/edges2shoes/train/'
     train_ds = Edge2Shoe(img_dir_tr)
     train_loader = DataLoader(train_ds,
                               batch_size=args.bz,
-                              drop_last=True,
                               shuffle=True,
+                              drop_last=True,
                               num_workers=4)
     img_dir_val = './data/edges2shoes/val/'
     val_ds = Edge2Shoe(img_dir_val)
-    val_loader = DataLoader(val_ds, batch_size=1, drop_last=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=1, num_workers=0)
     
     model = BicycleGAN(args, val_loader).to(device)
 
-    losses = {
+    metrics = {
         "loss_GAN_encode": [],
         "loss_GAN_random": [],
         "loss_image_l1": [],
         "loss_latent_l1": [],
         "loss_KL": [],
-        "total_loss": []
-
+        "total_loss": [],
+        "fid": [],
+        "lpips": []
     }
 
     total_steps = len(train_loader)*args.max_epochs
 
     step = 0
-    report_feq = 1000
-    save_freq = 3
+    report_feq = 100
 
     print("training starts ...")
     for e in range(args.max_epochs):
         start = time.time()
         
+        model.train()
         for idx, data in enumerate(train_loader):
             
             ########## Process Inputs ##########
@@ -122,26 +123,28 @@ if __name__ == "__main__":
             #-------------------------------
             #             Logging
             #-------------------------------
-            log_and_report(model, losses, step, report_feq, e, total_steps)
+            log_and_report(model, metrics, step, report_feq, e, total_steps)
             step += 1
                 
         
         end = time.time()
         print("Train Epoch: {}, Time: {:.3f}s".format(e+1, end-start))
 
-        if (e+1) % save_freq == 0:
-            # visualize
-            n_plot = 10
-            infer_viz(model, val_loader, epoch=e, n_plot=n_plot)
-            
-            # save results
-            save_results(model, losses, epoch=e)
-            
-            # report performance
-            # FID
-            gen_dataset, FID_score = eval_FID_score(model, val_loader, evaluate_num=200)
-            print('FID_score between real_dataset and generated image set: {:.3f}'.format(FID_score))
+        model.eval()
+        # visualize
+        n_plot = 10
+        infer_viz(model, val_loader, epoch=e, n_plot=n_plot)
+        
+        # save results
+        save_results(model, metrics, epoch=e)
+        
+        # report performance
+        # FID
+        FID_score = eval_FID_score(model, val_loader, evaluate_num=200)
+        print('FID_score between real_dataset and generated image set: {:.3f}'.format(FID_score))
+        metrics["fid"].append(FID_score)
 
-            # LPIPS score
-            lpips_score = eval_LPIPS_score(model, gen_dataset)
-            print('LPIPS score between real_dataset and generated image set: {:.3f}'.format(lpips_score))
+        # LPIPS score
+        lpips_score = eval_LPIPS_score(model, val_loader)
+        print('LPIPS score between real_dataset and generated image set: {:.3f}'.format(lpips_score))
+        metrics["lpips"].append(lpips_score)
