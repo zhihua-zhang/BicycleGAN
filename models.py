@@ -1,14 +1,15 @@
 
-import numpy as np
+import os
+from matplotlib import pyplot as plt
 import pdb
 
 import torch
 from torchvision.models import resnet18
-import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import TensorDataset
 
 import lpips
+from utils import norm, denorm
 
 
 ##############################
@@ -32,22 +33,23 @@ class BicycleGAN(nn.Module):
         self.D_VAE = Discriminator(args).to(device)
         self.D_LR = Discriminator(args).to(device)
 
-
-        self.optimizer_E = torch.optim.Adam(self.encoder.parameters(), lr=args.lr)
-        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=args.lr)
-        self.optimizer_D_VAE = torch.optim.Adam(self.D_VAE.parameters(), lr=args.lr)
-        self.optimizer_D_LR = torch.optim.Adam(self.D_LR.parameters(), lr=args.lr)
+        self.optimizer_E = torch.optim.Adam(self.encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer_D_VAE = torch.optim.Adam(self.D_VAE.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.optimizer_D_LR = torch.optim.Adam(self.D_LR.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
         self.valid = torch.ones(1)
         self.fake = torch.zeros(1)
 
         # FID real_set
+        os.makedirs("./data/eval/real_B", exist_ok=True)
         real_set = []
         for idx, data in enumerate(val_loader, 0):
             edge_tensor, rgb_tensor = data
-            real_B = rgb_tensor = rgb_tensor.to(device)
+            real_B = denorm(norm(rgb_tensor).to(device))
             
             real_set.append(real_B)
+            plt.imsave('./data/eval/real_B/real_B' + str(idx) + '.png', real_B.type(torch.uint8).cpu().squeeze().permute(1,2,0).numpy())
         self.real_dataset = TensorDataset(torch.cat(real_set))
     
     def forward_EG(self):
@@ -82,12 +84,14 @@ class BicycleGAN(nn.Module):
         self.valid_target_random = self.valid.expand_as(self.pred_fakeB_random).to(device)
         self.fake_target_random = self.fake.expand_as(self.pred_fakeB_random).to(device)
         
-        self.loss_G_GAN_encoded = self.gan_loss(self.pred_fakeB_encoded, self.valid_target_encoded)
+        self.loss_G_GAN_encoded = self.gan_loss(self.pred_fakeB_encoded, self.valid_target_encoded) * self.args.l_G
         self.loss_image_l1 = self.mae_loss(self.fakeB_encoded, self.real_B_encoded) * self.args.l_pixel
         self.loss_KL = 0.5 * torch.sum(torch.exp(self.logvar_B) + self.mu_B**2 - 1 - self.logvar_B, dim=1).mean() * self.args.l_kl
 
-        self.loss_G_GAN_random = self.gan_loss(self.pred_fakeB_random, self.valid_target_random)
-        loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random
+        self.loss_G_GAN_random = self.gan_loss(self.pred_fakeB_random, self.valid_target_random) * self.args.l_G
+        self.loss_image_l1_rev = -self.mae_loss(self.fake_B_random, self.real_B_random) * self.args.l_pixel_rev
+        
+        loss = self.loss_G_GAN_encoded + self.loss_image_l1 + self.loss_KL + self.loss_G_GAN_random + self.loss_image_l1_rev
         loss.backward(retain_graph=True)
         
         
@@ -218,28 +222,25 @@ class Unet_z(nn.Module):
         # downsample
         down = []
         down += [nn.ReflectionPad2d(1)]
-        down += [nn.Conv2d(self.input_nc, inner_nc, kernel_size=4, stride=2, padding=0)]
+        down += [nn.Conv2d(self.input_nc, inner_nc, kernel_size=4, stride=2, padding=0,)]
         if not innermost:
-            # (w,h)==(1,1), unable to ins norm
-            down += [nn.InstanceNorm2d(inner_nc)]
+            # when (w,h)==(1,1), we are unable to ins norm
+            down += [nn.InstanceNorm2d(inner_nc, affine=False, track_running_stats=False)]
         if not outermost:
-            # option 1: use Leaky ReLU
+            # use Leaky ReLU
             down = [nn.LeakyReLU(0.2, inplace=True)] + down
-            # down = [nn.ReLU(inplace=True)] + down
         
         # upsample
         up = []
         up += [nn.ReLU()]
         if not innermost:
             inner_nc *= 2
-        # option 3: how to upsample
         up += [
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(inner_nc, outer_nc, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(inner_nc, outer_nc, kernel_size=3, stride=1, padding=1, bias=False),
         ]
-        # up += [nn.ConvTranspose2d(inner_nc, outer_nc, kernel_size=4, stride=2, padding=1)]
         if not outermost:
-            up += [nn.InstanceNorm2d(outer_nc)]
+            up += [nn.InstanceNorm2d(outer_nc, affine=False, track_running_stats=False)]
         else:
             up += [nn.Tanh()]
             
@@ -285,16 +286,17 @@ class Generator(nn.Module):
         # image_shape = (3,128,128)
         image_nc, self.h, self.w = args.image_shape
         nz = args.nz
+        nz_to_hidden = nz if args.add_all else 0
         
-        # option 2: pass z to submodule, i.e., nz!=0
-        unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz, submodule=None, innermost=True)
+        # pass z to all submodules
+        unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz_to_hidden, submodule=None, innermost=True)
         
         for _ in range(n_unet - 5):
-            unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz, submodule=unet_block)
+            unet_block = Unet_z(base_nc*8, base_nc*8, base_nc*8, nz_to_hidden, submodule=unet_block)
 
-        unet_block = Unet_z(base_nc*4, base_nc*4, base_nc*8, nz, submodule=unet_block)
-        unet_block = Unet_z(base_nc*2, base_nc*2, base_nc*4, nz, submodule=unet_block)
-        unet_block = Unet_z(base_nc, base_nc, base_nc*2, nz, submodule=unet_block)
+        unet_block = Unet_z(base_nc*4, base_nc*4, base_nc*8, nz_to_hidden, submodule=unet_block)
+        unet_block = Unet_z(base_nc*2, base_nc*2, base_nc*4, nz_to_hidden, submodule=unet_block)
+        unet_block = Unet_z(base_nc, base_nc, base_nc*2, nz_to_hidden, submodule=unet_block)
         
         unet_block = Unet_z(image_nc, image_nc, base_nc, nz, submodule=unet_block, outermost=True)
         self.model = unet_block
@@ -322,7 +324,11 @@ class Discriminator(nn.Module):
         """
         
         image_nc, height, width = args.image_shape
-        input_nc = 2*image_nc
+        self.use_condGAN = args.use_condGAN
+
+        input_nc = image_nc
+        if self.use_condGAN:
+            input_nc *= 2
 
         # Calculate output shape of image discriminator (PatchGAN)
         self.output_shape = (1, height // 2 ** 4, width // 2 ** 4)
@@ -342,10 +348,13 @@ class Discriminator(nn.Module):
             *discriminator_block(256, 512),
             nn.ZeroPad2d((1, 0, 1, 0)),
             nn.Conv2d(512, 1, 4, padding=1),
-            nn.Sigmoid()
+            # nn.Sigmoid()
         )
 
     def forward(self, x):
         real_A, input_B = x
-        input = torch.cat([real_A, input_B], dim=1)
+        if self.use_condGAN:
+            input = torch.cat([real_A, input_B], dim=1)
+        else:
+            input = input_B
         return self.model(input)

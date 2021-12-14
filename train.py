@@ -1,6 +1,4 @@
 import os
-import warnings
-warnings.filterwarnings("ignore")
 import time
 import pdb
 import numpy as np
@@ -16,34 +14,34 @@ import argparse
 def get_args(args=None):
     parser = argparse.ArgumentParser(description='argparse')
     model_group = parser.add_argument_group(description='BicycleGAN')
-    model_group.add_argument("--run_mode", type=int, default=2,
-                             help="which mode we are running:\
-                                    image_load_viz:1,\
-                                    bbox_stat_hist_viz:2,\
-                                    pos_anchor_viz:3,\
-                                    model_train:4,\
-                                    top_proposal_viz:5,\
-                                    nms_infer_viz:6")
-    model_group.add_argument("--bz", type=int, default=128,
+    model_group.add_argument("--use_condGAN", type=int, default=0,
+                             help="whether use conditional GAN")
+    model_group.add_argument("--add_all", type=int, default=1,
+                             help="whether add latent code to all intermediate layers")
+    model_group.add_argument("--bz", type=int, default=32,
                              help="mini-batch size")
-    model_group.add_argument("--max_epochs", type=int, default=25,
+    model_group.add_argument("--max_epochs", type=int, default=50,
                              help="number of epochs")
+    model_group.add_argument("--l_G", type=float, default=1.0,
+                             help="lambda_GAN_G")
     model_group.add_argument("--l_pixel", type=float, default=10.,
                              help="lambda_pixel")
+    model_group.add_argument("--l_pixel_rev", type=float, default=0.05,
+                             help="lambda_pixel_rev")
     model_group.add_argument("--l_latent", type=float, default=0.5,
                              help="lambda_latent")
     model_group.add_argument("--l_kl", type=float, default=0.01,
                              help="lambda_kl")
     model_group.add_argument("--nz", type=int, default=8,
                              help="latent code dim")
-    model_group.add_argument("--base_lr", type=float, default=0.0002,
+    model_group.add_argument("--base_lr", type=float, default=1e-5,
                              help="initial lr")
     model_group.add_argument("--weight_decay", type=float, default=0.,
                              help="l2 weight decay")
-    model_group.add_argument("--lr_scheduler", type=list, default=[10,20,25],
-                             help="lr scheduler")
-    model_group.add_argument("--model_pth", type=str, default="",
-                             help="reload model path")
+    model_group.add_argument("--n_gen", type=int, default=8,
+                             help="number of plots to generate")
+    model_group.add_argument("--model_pth_dir", type=str, default="",
+                             help="directory of model path to reload")
     if args is None:
         args = parser.parse_args()
     else:
@@ -69,19 +67,20 @@ if __name__ == "__main__":
     train_ds = Edge2Shoe(img_dir_tr)
     train_loader = DataLoader(train_ds,
                               batch_size=args.bz,
-                              shuffle=True,
                               drop_last=True,
+                              shuffle=True,
                               num_workers=4)
     img_dir_val = './data/edges2shoes/val/'
     val_ds = Edge2Shoe(img_dir_val)
-    val_loader = DataLoader(val_ds, batch_size=1, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=1)
     
     model = BicycleGAN(args, val_loader).to(device)
-
+    
     metrics = {
         "loss_GAN_encode": [],
         "loss_GAN_random": [],
         "loss_image_l1": [],
+        "loss_image_l1_rev": [],
         "loss_latent_l1": [],
         "loss_KL": [],
         "total_loss": [],
@@ -92,10 +91,27 @@ if __name__ == "__main__":
     total_steps = len(train_loader)*args.max_epochs
 
     step = 0
-    report_feq = 100
+    report_freq = 100 * max(1, 128 // args.bz)
+    save_freq = 10
+    if args.model_pth_dir != "" and len(os.listdir(args.model_pth_dir)):
+        # reload results
+        for path in os.listdir(args.model_pth_dir):
+            if ".pth" in path:
+                name = path.split(".")
+                start_epoch = int(name[0].split("epoch=")[-1])
+                break
+        model.generator.load_state_dict(torch.load(os.path.join(args.model_pth_dir, f"generator-epoch={start_epoch}.pth"), map_location=device))
+        model.encoder.load_state_dict(torch.load(os.path.join(args.model_pth_dir, f"encoder-epoch={start_epoch}.pth"), map_location=device))
+        model.D_VAE.load_state_dict(torch.load(os.path.join(args.model_pth_dir, f"D_VAE-epoch={start_epoch}.pth"), map_location=device))
+        model.D_LR.load_state_dict(torch.load(os.path.join(args.model_pth_dir, f"D_LR-epoch={start_epoch}.pth"), map_location=device))
+
+        with open(f"./logs/metrics-epoch={start_epoch}", "r") as f:
+            metrics = json.load(f)
+    else:
+        start_epoch = 0
 
     print("training starts ...")
-    for e in range(args.max_epochs):
+    for e in range(start_epoch, args.max_epochs):
         start = time.time()
         
         model.train()
@@ -106,10 +122,10 @@ if __name__ == "__main__":
             edge_tensor, rgb_tensor = norm(edge_tensor).to(device), norm(rgb_tensor).to(device)
             real_A = edge_tensor; real_B = rgb_tensor;
 
-            # option 4: divide mini-batch images
+            # divide mini-batch images
             bz1 = len(real_A) // 2
             bz2 = len(real_A) - bz1
-            # A1, B1 for encoded; A2, B2 for random
+
             real_A_encoded = real_A[0:bz1]
             real_B_encoded = real_B[0:bz1]
             real_A_random = real_A[bz1:]
@@ -123,7 +139,7 @@ if __name__ == "__main__":
             #-------------------------------
             #             Logging
             #-------------------------------
-            log_and_report(model, metrics, step, report_feq, e, total_steps)
+            log_and_report(model, metrics, step, report_freq, e, total_steps)
             step += 1
                 
         
@@ -132,11 +148,11 @@ if __name__ == "__main__":
 
         model.eval()
         # visualize
-        n_plot = 10
-        infer_viz(model, val_loader, epoch=e, n_plot=n_plot)
+        infer_viz(model, val_loader, epoch=e, n_plot=10, n_gen=args.n_gen)
         
         # save results
-        save_results(model, metrics, epoch=e)
+        if (e+1) % save_freq == 0:
+            save_results(model, metrics, epoch=e)
         
         # report performance
         # FID

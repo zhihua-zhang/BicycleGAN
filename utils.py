@@ -1,7 +1,9 @@
 import os
+import subprocess
 import json
 import numpy as np
 import tqdm
+import scipy
 from scipy import linalg
 from matplotlib import pyplot as plt
 
@@ -10,7 +12,6 @@ from torch.utils.data import TensorDataset
 from pytorch_fid.inception import InceptionV3
 import torchvision.utils as vutils
 
-import lpips
 
 # Normalize image tensor
 def norm(image):
@@ -19,7 +20,6 @@ def norm(image):
 # Denormalize image tensor
 def denorm(tensor):
     return (tensor+1.0)/2.0
-	# return ((tensor+1.0)/2.0)*255.0
 
 def build_feature_table(dataset, model, batch_size, dim, device):
     '''
@@ -68,6 +68,7 @@ def compute_stat(feature_table):
     # compute mean and sigma based on activation table
     mu = np.mean(feature_table, axis=0)
     sigma = np.cov(feature_table, rowvar=False)
+
     return mu, sigma
 
 
@@ -87,7 +88,7 @@ def compute_FID(mu_1, sigma_1, mu_2, sigma_2, eps=1e-6):
 
     # compute square root of Sigma1*Sigma2 using "linalg.sqrtm" from scipy 
     # please name the resulting matrix as covmean
-    covmean = linalg.sqrtm(sigma_1.dot(sigma_2))
+    covmean = scipy.linalg.sqrtm(sigma_1.dot(sigma_2))
 
     # The following block take care of imagionary part of covmean 
     #################################################################
@@ -107,7 +108,7 @@ def compute_FID(mu_1, sigma_1, mu_2, sigma_2, eps=1e-6):
     #################################################################
 
     # compute FID score, based on eqution.(10) in pdf FID part.
-    FID_score = np.linalg.norm(mu_diff)**2 + np.diag(sigma_1 + sigma_2 - 2*covmean).sum()
+    FID_score = np.sum(mu_diff**2) + np.trace(sigma_1) + np.trace(sigma_2) - 2*np.trace(covmean)
     return FID_score
 
 
@@ -142,25 +143,30 @@ def FID(dataset_1, dataset_2, device, batch_size=64, dim=2048, block_idx = 3):
 
 def eval_FID_score(model, val_loader, evaluate_num = 200):
     device = model.device
+    os.makedirs("./data/eval/gen_B", exist_ok=True)
+    
     gen_set = []
     with torch.no_grad():
         for idx, data in enumerate(val_loader, 0):
             if idx == evaluate_num:
                 break
-            
+
             edge_tensor, rgb_tensor = data
-            edge_tensor, rgb_tensor = norm(edge_tensor).to(device), norm(rgb_tensor).to(device)
-            real_A = edge_tensor; real_B = rgb_tensor;
+            edge_tensor = norm(edge_tensor).to(device)
+            real_A = edge_tensor
             bz = real_A.size(0)
             
             z_random = torch.randn(bz, model.args.nz, device=device)
             gen_B_random = model.generator(real_A, z_random)
             fake_denorm = denorm(gen_B_random)
-            
             gen_set.append(fake_denorm)
+            
+            # plt.imsave('./data/eval/gen_B/gen_B' + str(idx) + '.png', fake_denorm.type(torch.uint8).cpu().squeeze().permute(1,2,0).numpy())
             
     gen_dataset = TensorDataset(torch.cat(gen_set))
     FID_score = FID(model.real_dataset, gen_dataset, device)
+    # output = subprocess.run([f"python -m pytorch_fid './data/eval/real_B' './data/eval/gen_B' --device {device}"], shell=True, capture_output=True, text=True)
+    # FID_score = float(output.stdout.split()[-1])
     return FID_score
 
 def eval_LPIPS_score(model, val_loader):
@@ -198,6 +204,7 @@ def log_and_report(model, metrics, step, report_feq, epoch, total_steps):
     loss_GAN_encode = model.loss_G_GAN_encoded.item() + model.loss_D_GAN_encoded.item()
     loss_GAN_random = model.loss_G_GAN_random.item() + model.loss_D_GAN_random.item()
     loss_image_l1 = model.loss_image_l1.item()
+    loss_image_l1_rev = model.loss_image_l1_rev.item()
     loss_latent_l1 = model.loss_latent_l1.item()
     loss_KL = model.loss_KL.item()
     total_loss = loss_GAN_encode + loss_GAN_random + loss_image_l1 + loss_latent_l1 + loss_KL
@@ -205,13 +212,14 @@ def log_and_report(model, metrics, step, report_feq, epoch, total_steps):
     metrics["loss_GAN_encode"].append(loss_GAN_encode)
     metrics["loss_GAN_random"].append(loss_GAN_random)
     metrics["loss_image_l1"].append(loss_image_l1)
+    metrics["loss_image_l1_rev"].append(loss_image_l1_rev)
     metrics["loss_latent_l1"].append(loss_latent_l1)
     metrics["loss_KL"].append(loss_KL)
     metrics["total_loss"].append(total_loss)
 
-    if step % report_feq == report_feq-1:
-        print('Epoch {}, Step {}/{}: Total Loss: {:.3f} loss_GAN_encode: {:.3f} loss_GAN_random: {:.3f} loss_image_l1: {:.3f} loss_latent_l1: {:.3f} loss_KL: {:.3f}'.format
-                    (epoch+1, step+1, total_steps, total_loss, loss_GAN_encode, loss_GAN_random, loss_image_l1, loss_latent_l1, loss_KL))
+    if (step+1) % report_feq == 0:
+        print('Epoch {}, Step {}/{}: Total Loss: {:.3f} loss_GAN_encode: {:.3f} loss_GAN_random: {:.3f}\n\t loss_image_l1: {:.3f} loss_image_l1_rev: {:.3f} loss_latent_l1: {:.3f} loss_KL: {:.3f}'.format
+                    (epoch+1, step+1, total_steps, total_loss, loss_GAN_encode, loss_GAN_random, loss_image_l1, loss_image_l1_rev, loss_latent_l1, loss_KL))
 
 def save_results(model, metrics, epoch):
     if os.path.exists("./checkpoints"):
@@ -228,14 +236,16 @@ def save_results(model, metrics, epoch):
     with open("./logs/metrics-epoch={}".format(epoch+1), "w") as f:
         json.dump(metrics, f)
 
-def infer_viz(model, val_loader, epoch, n_plot):
+def infer_viz(model, val_loader, epoch, n_eval, n_gen=8):
     device = model.device
-    imgs = []
-    fig, ax = plt.subplots(1, 1, figsize=(16, 3*n_plot))
 
+    real_edges = []
+    real_shoes = []
+    gen_shoes_encode = []
+    gen_shoes_random = [[] for _ in range(n_gen)]
     with torch.no_grad():
         for idx, data in enumerate(val_loader, 0):
-            if idx == n_plot:
+            if idx == n_eval:
                 break
             
             edge_tensor, rgb_tensor = data
@@ -243,22 +253,41 @@ def infer_viz(model, val_loader, epoch, n_plot):
             real_A = edge_tensor
             real_B = rgb_tensor
             bz = real_A.size(0)
-        
-            img = [real_A.cpu()]
-            for _ in range(3):
+
+            # cVAE-GAN G
+            mu_B, logvar_B = model.encoder(real_B)
+            z_encoded = torch.randn(bz, model.args.nz, device=device) * torch.exp(0.5 * logvar_B) + mu_B
+            gen_B_encoded = model.generator(real_A, z_encoded).detach()
+
+            # cLR-GAN G
+            for j in range(n_gen):
                 z_random = torch.randn(bz, model.args.nz, device=device)
                 gen_B_random = model.generator(real_A, z_random).detach().cpu()
-                img.append(gen_B_random)
-            img += [real_B.cpu()]
-            img = torch.cat(img)
-            imgs.append(img)
+                gen_shoes_random[j].append(gen_B_random)
+            
+            real_edges.append(real_A.cpu())
+            real_shoes.append(real_B.cpu())
+            gen_shoes_encode.append(gen_B_encoded.cpu())
 
-    imgs = torch.cat(imgs)
-    viz = vutils.make_grid(imgs, nrow=5, padding=2, normalize=True).permute(1,2,0)
+    real_edges, real_shoes, gen_shoes_encode = map(lambda x: torch.cat(x), [real_edges, real_shoes, gen_shoes_encode])
+    for j in range(n_gen):
+        gen_shoes_random[j] = torch.cat(gen_shoes_random[j])
 
-    ax.imshow(viz)
+    viz_real_edge = vutils.make_grid(real_edges, nrow=1, padding=2, normalize=True).permute(1,2,0)
+    viz_real_shoe = vutils.make_grid(real_shoes, nrow=1, padding=2, normalize=True).permute(1,2,0)
+    viz_gen_shoes_encode = vutils.make_grid(gen_shoes_encode, nrow=1, padding=2, normalize=True).permute(1,2,0)
+    viz_gen_shoes_random = [vutils.make_grid(gen_shoes_random[j], nrow=1, padding=2, normalize=True).permute(1,2,0) for j in range(n_gen)]
 
-    fig.suptitle(f"Images generated by bicycleGAN, epoch={epoch+1}", fontsize=18)
-    ax.set_title("left: real_edge, middle: fake_shoe, right: real_shoe")
+    fig, ax = plt.subplots(1, 3+n_gen, figsize=(3*(3+n_gen), 3*n_eval))
+    
+    ax[0].imshow(viz_real_edge); ax[0].set_title("Real edge")
+    ax[1].imshow(viz_real_shoe); ax[1].set_title("Real shoe")
+    ax[2].imshow(viz_gen_shoes_encode); ax[2].set_title("Gen shoe (encode)")
+    for j in range(n_gen):
+        ax[j+3].imshow(viz_gen_shoes_random[j])
+        if j == 0:
+            ax[j+3].set_title("Gen shoe (random)")
+    
+    
     os.makedirs("./results", exist_ok=True)
     fig.savefig(f"./results/biGAN_viz_epoch={epoch+1}.png")

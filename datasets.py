@@ -15,7 +15,7 @@ class Edge2Shoe(data.Dataset):
 	"""
 	def __init__(self, img_dir):
 		image_list = []
-		for img_file in glob.glob(str(img_dir)+'*'):
+		for img_file in sorted(glob.glob(str(img_dir)+'*')):
 			image_list.append(img_file)
 		self.image_list = image_list
 		
@@ -31,8 +31,6 @@ class Edge2Shoe(data.Dataset):
 
 
 
-
-
 if __name__ == '__main__':
 	img_dir = './data/edges2shoes/train/' 
 	dataset = Edge2Shoe(img_dir)
@@ -40,4 +38,3 @@ if __name__ == '__main__':
 	for idx, data in enumerate(loader):
 		edge_tensor, rgb_tensor = data
 		print(idx, edge_tensor.shape, rgb_tensor.shape)
-
