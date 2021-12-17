@@ -1,3 +1,8 @@
+## Final result
+
+![byGAN_viz](https://github.com/zhihua-zhang/CIS680_BicycleGAN/blob/main/results/bicycleGAN_res.png)
+
+
 ## CIS680 Final Project Code Instructions
 
 ### Training
